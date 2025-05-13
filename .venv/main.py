@@ -35,6 +35,7 @@ TOKEN_PATH = 'token.json'
 CLIENT_SECRETS = '.venv/client_secret.json'
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.modify',
     # Extend scopes for Drive, Sheets, Docs, Calendar, Keep
 ]
 GEMINI_MODEL = 'learnlm-2.0-flash-experimental'
@@ -75,16 +76,45 @@ def call_ai(prompt: str) -> dict:
     config = types.GenerateContentConfig(
         response_mime_type='text/plain',
         system_instruction=[
-            types.Part.from_text(text="""
-You are a JSON-outputting assistant. Given a user prompt, emit a single valid JSON object with keys: service, action, parameters.
-Example schema:
+    types.Part.from_text(text="""
+You are a JSON-outputting assistant for Google Workspace. Return a valid JSON with:
+- `service`: One of [gmail]
+- `action`: One of [send, read, summarize]
+- `parameters`: Dict with required fields for the action.
+
+Examples:
+1. Send email:
 {
   "service": "gmail",
   "action": "send",
-  "parameters": { "to": "...", "subject": "...", "body": "..." }
+  "parameters": {
+    "to": "someone@example.com",
+    "subject": "Hello",
+    "body": "This is a test"
+  }
 }
-""")
-        ],
+
+2. Read emails:
+{
+  "service": "gmail",
+  "action": "read",
+  "parameters": {
+    "count": 5
+  }
+}
+
+3. Summarize emails:
+{
+  "service": "gmail",
+  "action": "summarize",
+  "parameters": {
+    "count": 3
+  }
+}
+Only output raw JSON.
+""" )
+    ]
+
     )
 
     # Stream response
@@ -111,6 +141,42 @@ Example schema:
         raise ValueError(f'Failed to parse intent JSON: {e}\nResponse was: {text}')
     return intent
 
+def list_emails(service, count=5):
+    """List recent emails."""
+    results = service.users().messages().list(userId='me', maxResults=count).execute()
+    messages = results.get('messages', [])
+    email_data = []
+
+    for msg in messages:
+        msg_detail = service.users().messages().get(userId='me', id=msg['id']).execute()
+        headers = msg_detail['payload'].get('headers', [])
+        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+        from_ = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
+        snippet = msg_detail.get('snippet', '')
+        email_data.append({'from': from_, 'subject': subject, 'snippet': snippet})
+    
+    return email_data
+
+
+def summarize_emails_with_ai(service, count=3):
+    """Summarize recent emails and identify spam using Gemini."""
+    emails = list_emails(service, count)
+    summary_prompt = "Summarize the following emails and indicate which ones look like spam:\n\n"
+    for idx, email in enumerate(emails, 1):
+        summary_prompt += f"{idx}. From: {email['from']}\nSubject: {email['subject']}\nSnippet: {email['snippet']}\n\n"
+
+    client = genai.Client(api_key=os.environ['API_KEY'])
+    contents = [
+        types.Content(role='user', parts=[types.Part.from_text(text=summary_prompt)])
+    ]
+    response = ""
+    for chunk in client.models.generate_content_stream(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=types.GenerateContentConfig(response_mime_type='text/plain')
+    ):
+        response += chunk.text
+    print("📬 Email summary:\n", response)
 
 def send_email(service, to: str, subject: str, body: str):
     """Send an email via Gmail API."""
@@ -137,11 +203,20 @@ def main():
     params = intent.get('parameters', {})
 
     # Basic routing
-    if service == 'gmail' and action == 'send':
-        send_email(gmail_svc, params.get('to', ''), params.get('subject', ''), params.get('body', ''))
-    else:
-        print('❌ Unsupported intent:')
-        print(json.dumps(intent, indent=2))
+    if service == 'gmail':
+        if action == 'send':
+            send_email(gmail_svc, params.get('to', ''), params.get('subject', ''), params.get('body', ''))
+        elif action == 'read':
+            count = int(params.get('count', 5))
+            emails = list_emails(gmail_svc, count)
+            print("📥 Recent Emails:")
+            for i, mail in enumerate(emails, 1):
+                print(f"{i}. From: {mail['from']} | Subject: {mail['subject']}\n   Snippet: {mail['snippet']}\n")
+        elif action == 'summarize':
+            summarize_emails_with_ai(gmail_svc, int(params.get('count', 3)))
+        else:
+            print(f"⚠️ Unsupported Gmail action: {action}")
+
 
 
 if __name__ == '__main__':

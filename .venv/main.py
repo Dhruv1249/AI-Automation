@@ -27,6 +27,9 @@ from google.oauth2.credentials import Credentials
 from google import genai
 from google.genai import types
 from intent_router import route_intent
+from utils.ai import AIIntentParser
+from datetime import datetime, timezone, timedelta
+from google.auth.exceptions import RefreshError
 
 # Load environment variables
 load_dotenv()
@@ -36,126 +39,75 @@ TOKEN_PATH = 'token.json'
 CLIENT_SECRETS = '.venv/client_secret.json'
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.send',
-    'https://www.googleapis.com/auth/gmail.modify',
-    # Extend scopes for Drive, Sheets, Docs, Calendar, Keep
+    'https://www.googleapis.com/auth/gmail.compose',
+    'https://www.googleapis.com/auth/gmail.modify',     # ✅ needed for delete, mark, move
+    'https://www.googleapis.com/auth/gmail.readonly',   # optional, covered by modify
+    'https://www.googleapis.com/auth/calendar.events',
+    'https://www.googleapis.com/auth/calendar.readonly',
 ]
+
 GEMINI_MODEL = 'learnlm-2.0-flash-experimental'
 
 
 def get_credentials():
-    """
-    Handles OAuth flow and token persistence.
-    Loads existing tokens from TOKEN_PATH or runs local server flow if needed.
-    """
     creds = None
+
+    # Step 1: Load existing credentials
     if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    # Refresh if expired
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        except Exception as e:
+            print(f"⚠️ Failed to load token file: {e}")
+            creds = None
+
+    # Step 2: Refresh if possible
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
+        try:
+            creds.refresh(Request())
+            print("🔁 Token refreshed successfully.")
+        except RefreshError as e:
+            print(f"⚠️ Failed to refresh token: {e}")
+            creds = None  # Fall back to new flow
+    elif not creds or not creds.valid:
+        # Step 3: Fallback to OAuth flow
+        print("🔑 Launching OAuth flow...")
         flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS, SCOPES)
         creds = flow.run_local_server(port=0)
-    # Save tokens for next run
-    with open(TOKEN_PATH, 'w') as token_file:
-        token_file.write(creds.to_json())
+
+    # Step 4: Save credentials back
+    if creds:
+        try:
+            with open(TOKEN_PATH, "w") as token_file:
+                token_file.write(creds.to_json())
+        except Exception as e:
+            print(f"⚠️ Failed to write token file: {e}")
+
     return creds
 
 
-def call_ai(prompt: str) -> dict:
-    """
-    Calls Google Gemini to generate a JSON intent based on the prompt.
-    """
-    api_key = os.environ.get('API_KEY')
-    if not api_key:
-        raise RuntimeError('Please set GEMINI_API_KEY in your environment (.env file).')
-
-    client = genai.Client(api_key=api_key)
-    print("AI STARTED")
-    # Prepare conversation
-    user_content = types.Content(role='user', parts=[types.Part.from_text(text=prompt)])
-    config = types.GenerateContentConfig(
-        response_mime_type='text/plain',
-        system_instruction=[
-    types.Part.from_text(text="""
-You are a JSON-outputting assistant for Google Workspace. Return a valid JSON with:
-- `service`: One of [gmail]
-- `action`: One of [send, read, summarize]
-- `parameters`: Dict with required fields for the action.
-
-Examples:
-1. Send email:
-{
-  "service": "gmail",
-  "action": "send",
-  "parameters": {
-    "to": "someone@example.com",
-    "subject": "Hello",
-    "body": "This is a test"
-  }
-}
-
-2. Read emails:
-{
-  "service": "gmail",
-  "action": "read",
-  "parameters": {
-    "count": 5
-  }
-}
-
-3. Summarize emails:
-{
-  "service": "gmail",
-  "action": "summarize",
-  "parameters": {
-    "count": 3
-  }
-}
-Only output raw JSON.
-""" )
-    ]
-
-    )
-
-    # Stream response
-    response_text = ''
-    for chunk in client.models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=[user_content],
-            config=config):
-        response_text += chunk.text
-
-    # Clean code fences if present
-    text = response_text.strip()
-    if text.startswith('```'):
-        text = text[text.find('\n')+1:]
-    if text.endswith('```'):
-        text = text[:text.rfind('```')]
-    text = text.strip()
-
-    # Parse JSON
-    print(text)
-    try:
-        intent = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f'Failed to parse intent JSON: {e}\nResponse was: {text}')
-    return intent
-
-
-
 def main():
-    print('🔐 Authenticating with Google...')
+    print(' Authenticating with Google...')
     creds = get_credentials()
     gmail_svc = build('gmail', 'v1', credentials=creds)
-    print('✅ Authentication successful.')
-
-    prompt = input('💬 Enter your prompt for AI-driven action: ')
-    intent = call_ai(prompt)
-    if not intent:
-        print('❌ No intent returned from AI.')
-        return
-    route_intent(gmail_svc,intent)
+    calendar_svc = build('calendar', 'v3', credentials=creds)
+    print(' Authentication successful.')
+    prompt = " "
+    ai = AIIntentParser()
+    while(prompt!='q'):
+        prompt = input(' Enter your prompt for AI-driven action: ')
+        intent = ai.parse_prompt(prompt)
+        if not intent:
+            print('❌ No intent returned from AI.')
+            return
+        if intent.get('service') == 'chat':
+            answer = ai.chat_ai(prompt)
+            print(f" {answer}")
+        else:
+            route_intent(
+            {'gmail': gmail_svc, 'calendar': calendar_svc},
+            intent,
+            raw_prompt=prompt
+        )
     
 
 

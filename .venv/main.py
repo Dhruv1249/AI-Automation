@@ -44,6 +44,7 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',   # optional, covered by modify
     'https://www.googleapis.com/auth/calendar.events',
     'https://www.googleapis.com/auth/calendar.readonly',
+    'https://www.googleapis.com/auth/drive',
 ]
 
 GEMINI_MODEL = 'learnlm-2.0-flash-experimental'
@@ -89,22 +90,26 @@ def main():
     print(' Authenticating with Google...')
     creds = get_credentials()
     gmail_svc = build('gmail', 'v1', credentials=creds)
+    drive_svc = build('drive','v3',credentials=creds)
     calendar_svc = build('calendar', 'v3', credentials=creds)
     print(' Authentication successful.')
     prompt = " "
     ai = AIIntentParser()
     while(prompt!='q'):
         prompt = input(' Enter your prompt for AI-driven action: ')
+        if(prompt=='q'):
+            return
         intent = ai.parse_prompt(prompt)
+        
         if not intent:
             print('❌ No intent returned from AI.')
             return
         if intent.get('service') == 'chat':
             answer = ai.chat_ai(prompt)
-            print(f" {answer}")
+            
         else:
             route_intent(
-            {'gmail': gmail_svc, 'calendar': calendar_svc},
+            {'gmail': gmail_svc, 'calendar': calendar_svc, 'drive':drive_svc},
             intent,
             raw_prompt=prompt
         )

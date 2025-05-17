@@ -1,4 +1,5 @@
 # utils/ai.py
+import re
 
 import os
 import json
@@ -57,6 +58,15 @@ Parse the user’s request into **one** JSON object with:
        – start (RFC3339 string) & end (RFC3339 string)
        – date (\"YYYY-MM-DD\" or \"tomorrow\") & summary (string, opt) & description (opt) & time (\"3pm\" style, opt)
     If only date is given, default to a 1‑hour slot 09:00–10:00 local time.
+**Supported Drive actions**:
++  • list_files      → query (string, opt), mime_type (string, opt), count (int, opt)
++  • get_file_info   → file_id (string, required)
++  • download_file   → file_id (string, required), save_path (string, opt)
++  • upload_file     → file_path (string, required), mime_type (string, opt), folder_id (string, opt)
++  • delete_file     → file_id (string, required)
++  • create_folder   → name (string, required), parent_id (string, opt)
++  • move_file       → file_id (string, required), folder_id (string, required)
++  • share_file      → file_id (string, required), email (string, required), role (string), type (string)
 
 **Multi‑action sequencing**:
   If the user requests multiple tasks (e.g. “Send an email, then list my last 3”), list them in order in "actions".
@@ -89,18 +99,27 @@ Output **only** the JSON—no extra text.
                 response_text += chunk.text
 
         # Attempt JSON parse
-        try:
-            return json.loads(response_text)
-        except json.JSONDecodeError:
-            # Chat fallback
-            print("\n🤖 (chat fallback)")
-            for chunk in self.client.models.generate_content_stream(
-                model=self.model,
-                contents=[types.Content(role="user",
-                                        parts=[types.Part.from_text(text=user_prompt)])]
-            ):
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError as je:
+                print(f"\n❌ JSON parse error: {je}")
+        else:
+            print("\n❌ No JSON object found in AI response.")
+
+        # Chat fallback
+        print("\n🤖 (chat fallback)")
+        chat_response = ""
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=[types.Content(role="user",
+                                    parts=[types.Part.from_text(user_prompt)])]
+        ):
+            if chunk.text:
                 print(chunk.text, end="")
-            return None
+                chat_response += chunk.text
+        return None
         
     def chat_ai(self,prompt: str) -> str:
       try:

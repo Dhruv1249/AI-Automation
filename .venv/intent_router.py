@@ -1,21 +1,26 @@
 # intent_router.py
-
+import os
 from datetime import datetime, timezone, timedelta
 from services import email_service as es
 from services import calendar_service as cs
-
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 # Asia/Kolkata timezone
 IST = timezone(timedelta(hours=5, minutes=30))
+folder_map: dict[str, str] = {}
+
 
 def route_intent(service_clients: dict, intent: dict, raw_prompt: str = ""):
     """
     Dispatch multi-action intent *dynamically*, using outputs of prior steps
     whenever an action lacks explicit target IDs.
     """
+    global folder_map 
     gmail_svc = service_clients.get("gmail")
     cal_svc   = service_clients.get("calendar")
+    drive_svc = service_clients.get("drive")
 
     service = intent.get("service")
+    svc = intent.get("service")
     actions = intent.get("actions", [])
 
     # Will hold the list of last-returned items (each item must have 'id')
@@ -292,7 +297,180 @@ def route_intent(service_clients: dict, intent: dict, raw_prompt: str = ""):
 
             except Exception as e:
                 print(f"❌ Calendar action '{act}' failed: {e}")
+    
+    # -- DRIVE --
+    elif svc == "drive":
+        if not drive_svc:
+            print("⚠️ Drive service not initialized.")
+            return
 
+        # Helper to lookup an existing folder by name
+        def get_folder_id_by_name(name: str) -> str | None:
+            resp = drive_svc.files().list(
+                q=f"mimeType='application/vnd.google-apps.folder' and name='{name}' and trashed=false",
+                spaces='drive',
+                fields="files(id, name)"
+            ).execute()
+            files = resp.get("files", [])
+            return files[0]["id"] if files else None
+
+        for item in actions:
+            action = (item.get("action") or "").lower()
+            params = item.get("parameters") or {}
+
+            try:
+                # --------- LIST_FILES ---------
+                if action == "list_files":
+                    q = params.get("query")
+                    mime = params.get("mime_type")
+                    n = int(params.get("count", 10))
+                    query_parts = []
+                    if q:   query_parts.append(f"name contains '{q}'")
+                    if mime: query_parts.append(f"mimeType = '{mime}'")
+                    final_q = " and ".join(query_parts) if query_parts else None
+
+                    resp = drive_svc.files().list(
+                        q=final_q,
+                        pageSize=n,
+                        fields="files(id, name, mimeType, size)"
+                    ).execute()
+                    files = resp.get("files", [])
+                    print(f"📂 Found {len(files)} files:")
+                    for f in files:
+                        sz = f.get("size", "—")
+                        print(f"- {f['name']} ({f['mimeType']}, {sz} bytes) [ID: {f['id']}]")
+
+                # --------- GET_FILE_INFO ---------
+                elif action == "get_file_info":
+                    fid = params.get("file_id")
+                    if not fid: raise ValueError("Missing file_id")
+                    f = drive_svc.files().get(
+                        fileId=fid,
+                        fields="id, name, mimeType, size, owners"
+                    ).execute()
+                    owners = ", ".join(o["emailAddress"] for o in f.get("owners", []))
+                    print(f"🛈 {f['name']} ({f['mimeType']}, {f.get('size','—')} bytes) owned by {owners}")
+
+                # --------- DOWNLOAD_FILE ---------
+                elif action == "download_file":
+                    raw = params.get("file_id")
+                    if not raw:
+                        raise ValueError("Missing file_id")
+
+                    # Helper: resolve name → ID if needed
+                    fid = raw
+                    if "-" not in raw and "_" not in raw:
+                        # assume it's a name, not an ID
+                        resp = drive_svc.files().list(
+                            q=f"name = '{raw}' and trashed=false",
+                            spaces='drive',
+                            fields="files(id, name)"
+                        ).execute()
+                        files = resp.get("files", [])
+                        if not files:
+                            raise ValueError(f"No file found with name '{raw}'")
+                        fid = files[0]["id"]
+
+                    # Now perform the download
+                    path = params.get("save_path") or raw
+                    request = drive_svc.files().get_media(fileId=fid)
+                    fh = open(path, "wb")
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while not done:
+                        status, done = downloader.next_chunk()
+                    fh.close()
+                    print(f"✅ Downloaded file '{raw}' (ID: {fid}) to {path}")
+
+                # --------- UPLOAD_FILE ---------
+                elif action == "upload_file":
+                    fp = params.get("file_path")
+                    if not fp: raise ValueError("Missing file_path")
+                    # Resolve folder name → ID
+                    folder_name = params.get("folder_id")
+                    folder_id = None
+                    if folder_name:
+                        # first look in our map
+                        folder_id = folder_map.get(folder_name)
+                        if not folder_id:
+                            # fallback to Drive lookup
+                            folder_id = get_folder_id_by_name(folder_name)
+                            if folder_id:
+                                folder_map[folder_name] = folder_id
+                    media = MediaFileUpload(fp, mimetype=params.get("mime_type"), resumable=True)
+                    body = {"name": os.path.basename(fp)}
+                    if folder_id:
+                        body["parents"] = [folder_id]
+                    f = drive_svc.files().create(
+                        body=body,
+                        media_body=media,
+                        fields="id,name"
+                    ).execute()
+                    print(f"✅ Uploaded '{f['name']}' (ID: {f['id']})")
+
+                # --------- DELETE_FILE ---------
+                elif action == "delete_file":
+                    fid = params.get("file_id")
+                    if not fid: raise ValueError("Missing file_id")
+                    drive_svc.files().delete(fileId=fid).execute()
+                    print(f"🗑️ Deleted file {fid}")
+
+                # --------- CREATE_FOLDER ---------
+                elif action == "create_folder":
+                    name = params.get("name")
+                    if not name: raise ValueError("Missing name")
+                    body = {
+                        "name": name,
+                        "mimeType": "application/vnd.google-apps.folder"
+                    }
+                    if params.get("parent_id"):
+                        body["parents"] = [params["parent_id"]]
+                    f = drive_svc.files().create(body=body, fields="id,name").execute()
+                    folder_map[name] = f["id"]
+                    print(f"📁 Folder '{f['name']}' created (ID: {f['id']})")
+
+                # --------- MOVE_FILE ---------
+                elif action == "move_file":
+                    fid = params.get("file_id")
+                    target = params.get("folder_id")
+                    if not fid or not target: raise ValueError("Missing file_id or folder_id")
+                    # resolve folder_id if name
+                    folder_id = folder_map.get(target) or get_folder_id_by_name(target)
+                    if not folder_id:
+                        raise ValueError(f"Folder '{target}' not found")
+                    file_meta = drive_svc.files().get(
+                        fileId=fid, fields="parents"
+                    ).execute()
+                    prev = ",".join(file_meta.get("parents", []))
+                    drive_svc.files().update(
+                        fileId=fid,
+                        addParents=folder_id,
+                        removeParents=prev,
+                        fields="id,parents"
+                    ).execute()
+                    print(f"📦 Moved file {fid} to folder ID {folder_id}")
+
+                # --------- SHARE_FILE ---------
+                elif action == "share_file":
+                    fid = params.get("file_id")
+                    email = params.get("email")
+                    role = params.get("role", "reader")
+                    mtype = params.get("type", "user")
+                    if not fid or not email:
+                        raise ValueError("Missing file_id or email")
+                    drive_svc.permissions().create(
+                        fileId=fid,
+                        body={"type": mtype, "role": role, "emailAddress": email},
+                        fields="id"
+                    ).execute()
+                    print(f"🔑 Shared file {fid} with {email} as {role}")
+
+                else:
+                    print(f"⚠️ Unsupported Drive action: {action}")
+
+            except Exception as e:
+                print(f"❌ Drive action '{action}' failed: {e}")
+        return
 
     else:
         print("ERROR")
